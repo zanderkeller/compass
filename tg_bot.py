@@ -1,0 +1,864 @@
+import os
+import re
+import asyncio
+import logging
+import sqlite3
+import random
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from aiogram.types import WebAppInfo
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+
+# =========================
+# НАСТРОЙКИ ЧЕРЕЗ ENV
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+APP_URL = os.getenv("APP_URL", "").strip()
+DB_PATH = os.getenv("DB_PATH", "/opt/compass/web/compass.db").strip()
+
+DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Europe/Moscow").strip()
+POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "20"))
+
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN")
+if not APP_URL:
+    raise RuntimeError("Не задан APP_URL (ссылка на приложение COMPASS)")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("compass_tg_bot")
+
+# =========================
+# ТЕКСТЫ СООБЩЕНИЙ
+# =========================
+MSG_START_REGISTERED = (
+    "Вы в системе.\n"
+    "Открывайте COMPASS по кнопке ниже.\n"
+    "Настройки уведомлений: /notifications"
+)
+MSG_START_NOT_REGISTERED = (
+    "Похоже, вы ещё не зарегистрированы в COMPASS.\n"
+    "Откройте приложение, пройдите регистрацию и вернитесь сюда."
+)
+MSG_MYTIME_NOT_FOUND = "Настройки уведомлений не найдены. Сначала зарегистрируйтесь в COMPASS и нажмите /start."
+
+MSG_CHECKIN_REMINDER = "Чек-ин: отметьте состояние в COMPASS."
+MSG_CHECKOUT_REMINDER = "Чек-аут: зафиксируйте итог дня в COMPASS."
+
+MSG_NOTIFY_HEADER = "Настройка уведомлений."
+MSG_NOTIFY_TIME_PROMPT = "Введите время в формате HH:MM (например 09:30)."
+MSG_NOTIFY_BAD_TIME = "Не похоже на HH:MM. Пример: 09:30"
+MSG_NOTIFY_DB_ERROR = "Не могу прочитать/записать настройки (ошибка базы данных)."
+
+# =========================
+# ШАБЛОНЫ ТЕКСТОВ УВЕДОМЛЕНИЙ (редактируйте здесь)
+# =========================
+# Идея: чем ближе к завершению аскезы, тем более подбадривающие формулировки.
+# Можно добавлять/удалять варианты ~ бот будет выбирать случайный.
+
+# ЧЕК-ИН / ЧЕК-АУТ (опционально)
+CHECKIN_TEMPLATES = [
+    "⏰ Время короткого чек-ина. Как вы сейчас?",
+    "🌿 Пауза на минуту: отметьте состояние в COMPASS.",
+    "🧭 Загляните внутрь: чек-ин ждёт вас в COMPASS.",
+]
+
+CHECKOUT_TEMPLATES = [
+    "🌙 Подведите итог дня в COMPASS. Даже пара слов ~ уже забота о себе.",
+    "✨ Чек-аут: зафиксируйте, как прошёл день.",
+    "🧩 Соберите день в одну мысль: чек-аут в COMPASS.",
+]
+
+# АСКЕЗЫ
+ASKEZA_TEMPLATES = {
+    # начало/первые дни
+    "start": [
+        "🚀 Отличный старт. Маленький шаг сегодня = большая привычка завтра.",
+        "🔥 Продолжаем! Главное ~ не скорость, а регулярность.",
+        "🌱 Закладываете фундамент. Держим курс!",
+    ],
+    # середина
+    "middle": [
+        "💪 Это уже не вдохновение, это дисциплина. Вы круты.",
+        "🧠 Привычка формируется прямо сейчас. Ещё немного ~ и станет легче.",
+        "🌊 В середине пути часто тихо. И это значит: вы делаете дело.",
+    ],
+    # близко к финишу
+    "almost": [
+        "🏁 Финиш уже виден! Не отдавайте победу за шаг до неё.",
+        "⚡ Совсем чуть-чуть. Доведите до красивого завершения.",
+        "🎯 Вы почти у цели. Сегодняшний шаг особенно важен.",
+    ],
+    # последний день/финал
+    "final": [
+        "🥇 Финальный рывок! Сегодня вы закрываете цикл. Горжусь вами.",
+        "🎉 Последний день! Сделайте это красиво ~ и отпразднуйте.",
+        "🏆 Это тот самый день: вы доходите до конца. Давайте!",
+    ],
+}
+
+
+def pick_one(variants: list[str], fallback: str) -> str:
+    variants = [v for v in (variants or []) if isinstance(v, str) and v.strip()]
+    return random.choice(variants) if variants else fallback
+
+
+def build_checkin_text() -> str:
+    return pick_one(CHECKIN_TEMPLATES, MSG_CHECKIN_REMINDER)
+
+
+def build_checkout_text() -> str:
+    return pick_one(CHECKOUT_TEMPLATES, MSG_CHECKOUT_REMINDER)
+
+
+def build_askeza_text(title: str, current_day: int, duration: int) -> str:
+    """Формирует текст уведомления по аскезе с мотивацией в зависимости от прогресса."""
+    dur = max(int(duration or 1), 1)
+    # current_day в базе может быть 0-индекс или 1-индекс.
+    # Мы отображаем как "сегодня день X/Y" где X >= 1.
+    day = min(max(int(current_day) + 1, 1), dur)
+    left = max(dur - day, 0)
+
+    progress = day / dur
+    if left <= 0:
+        stage = "final"
+    elif progress >= 0.8:
+        stage = "almost"
+    elif progress >= 0.4:
+        stage = "middle"
+    else:
+        stage = "start"
+
+    pep = pick_one(ASKEZA_TEMPLATES.get(stage, []), "💛 Вы справитесь.")
+
+    return (
+        f"Аскеза: {title}\n"
+        f"Сегодня: день {day}/{dur}\n"
+        f"{pep}"
+    )
+
+# =========================
+# FSM
+# =========================
+class NotifyStates(StatesGroup):
+    waiting_time = State()
+
+
+# =========================
+# DB
+# =========================
+def db_connect():
+    # timeout побольше, чтобы не отваливалось при кратких блокировках
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def ensure_tables():
+    """
+    Создаём только то, что нужно для напоминаний.
+    Таблицы users/emotion_entries/askeza_entries у вас уже есть, поэтому их НЕ трогаем.
+    """
+    with db_connect() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS notification_settings (
+          telegram_id INTEGER PRIMARY KEY,
+          timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
+
+          checkin_time  TEXT NOT NULL DEFAULT '12:00',
+          checkout_time TEXT NOT NULL DEFAULT '21:00',
+
+          enable_checkin  INTEGER NOT NULL DEFAULT 1,
+          enable_checkout INTEGER NOT NULL DEFAULT 1,
+
+          -- мастер-переключатель "все аскезы"
+          enable_askeza   INTEGER NOT NULL DEFAULT 1,
+
+          quiet_start TEXT DEFAULT NULL,
+          quiet_end   TEXT DEFAULT NULL,
+
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+          FOREIGN KEY (telegram_id) REFERENCES users (telegram_id) ON DELETE CASCADE
+        )
+        """)
+
+        # Пер-аскеза: включено/выключено + своё время
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS askeza_reminder_settings (
+          telegram_id INTEGER NOT NULL,
+          askeza_id   INTEGER NOT NULL,
+          time        TEXT    NOT NULL DEFAULT '12:00',
+          enabled     INTEGER NOT NULL DEFAULT 1,
+          created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (telegram_id, askeza_id),
+          FOREIGN KEY (telegram_id) REFERENCES users (telegram_id) ON DELETE CASCADE
+        )
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_askeza_reminders_tg
+        ON askeza_reminder_settings (telegram_id)
+        """)
+
+        # Лог, чтобы не слать по 2 раза в день одно и то же
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS reminder_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          telegram_id INTEGER NOT NULL,
+          kind TEXT NOT NULL,    -- 'checkin' | 'checkout' | 'askeza:<id>'
+          date TEXT NOT NULL,    -- YYYY-MM-DD (локальная дата пользователя)
+          sent_at TEXT NOT NULL, -- ISO UTC
+          UNIQUE(telegram_id, kind, date)
+        )
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_reminder_log_tgd_kind_date
+        ON reminder_log (telegram_id, kind, date)
+        """)
+        conn.commit()
+
+
+def user_exists(telegram_id: int) -> bool:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM users WHERE telegram_id=? LIMIT 1",
+            (telegram_id,),
+        ).fetchone()
+        return row is not None
+
+
+def ensure_notification_settings_row(telegram_id: int):
+    """
+    Создаём настройки только если пользователь уже есть в users.
+    Иначе FK не позволит (и это правильно).
+    """
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO notification_settings (telegram_id, created_at, updated_at)
+            VALUES (?, datetime('now'), datetime('now'))
+        """, (telegram_id,))
+        conn.commit()
+
+
+def ensure_askeza_reminder_rows(conn: sqlite3.Connection, telegram_id: int):
+    """
+    Подтягиваем в таблицу настроек все активные аскезы пользователя.
+    Время по умолчанию: notification_settings.checkin_time? нет, берём 12:00.
+    """
+    row = conn.execute(
+        "SELECT timezone, enable_askeza FROM notification_settings WHERE telegram_id=?",
+        (telegram_id,),
+    ).fetchone()
+    _ = row  # не используем, но оставляем на будущее
+
+    default_time = "12:00"
+    # Если раньше у вас было одно поле askeza_time, попробуем мигрировать:
+    # (оно могло быть в старой версии таблицы; если колонки нет — игнорируем)
+    try:
+        r2 = conn.execute(
+            "SELECT askeza_time FROM notification_settings WHERE telegram_id=?",
+            (telegram_id,),
+        ).fetchone()
+        if r2 and r2["askeza_time"]:
+            default_time = r2["askeza_time"]
+    except sqlite3.OperationalError:
+        pass
+
+    askezas = conn.execute(
+        "SELECT id FROM askeza_entries WHERE telegram_id=? AND is_active=1",
+        (telegram_id,),
+    ).fetchall()
+
+    for a in askezas:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO askeza_reminder_settings (telegram_id, askeza_id, time, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, 1, datetime('now'), datetime('now'))
+            """,
+            (telegram_id, int(a["id"]), default_time),
+        )
+
+
+# =========================
+# Кнопка - ссылка на приложуху
+# =========================
+def compass_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Открыть COMPASS",
+                web_app=WebAppInfo(url=APP_URL)
+            )
+        ]]
+    )
+
+
+
+def hhmm_is_valid(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", (value or "").strip()))
+
+
+def parse_hhmm(value: str | None, default: str) -> tuple[int, int]:
+    v = (value or default).strip()
+    if not hhmm_is_valid(v):
+        v = default
+    h, m = v.split(":")
+    return int(h), int(m)
+
+
+def in_one_minute_window(now_local: datetime, target_h: int, target_m: int) -> bool:
+    # Окно 60 секунд, чтобы не зависеть от точного тика цикла.
+    t = now_local.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
+    return abs((now_local - t).total_seconds()) <= 60
+
+
+def in_quiet_hours(now_local: datetime, quiet_start: str | None, quiet_end: str | None) -> bool:
+    """
+    Тихие часы: если заданы, не шлём уведомления.
+    Формат HH:MM.
+    """
+    if not quiet_start or not quiet_end:
+        return False
+    if not (hhmm_is_valid(quiet_start) and hhmm_is_valid(quiet_end)):
+        return False
+
+    sh, sm = parse_hhmm(quiet_start, "00:00")
+    eh, em = parse_hhmm(quiet_end, "00:00")
+
+    start = now_local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end = now_local.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    if start <= end:
+        return start <= now_local <= end
+    # тихие часы через полночь
+    return now_local >= start or now_local <= end
+
+
+def emotion_entry_exists(conn: sqlite3.Connection, telegram_id: int, day_iso: str, entry_type: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM emotion_entries WHERE telegram_id=? AND date=? AND type=? LIMIT 1",
+        (telegram_id, day_iso, entry_type),
+    ).fetchone()
+    return row is not None
+
+
+def get_active_askezas(conn: sqlite3.Connection, telegram_id: int):
+    return conn.execute(
+        "SELECT id, title, duration, current_day FROM askeza_entries WHERE telegram_id=? AND is_active=1 ORDER BY id DESC",
+        (telegram_id,),
+    ).fetchall()
+
+
+def already_sent(conn: sqlite3.Connection, telegram_id: int, kind: str, day_iso: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM reminder_log WHERE telegram_id=? AND kind=? AND date=? LIMIT 1",
+        (telegram_id, kind, day_iso),
+    ).fetchone()
+    return row is not None
+
+
+def mark_sent(conn: sqlite3.Connection, telegram_id: int, kind: str, day_iso: str, sent_at_iso_utc: str):
+    conn.execute(
+        "INSERT OR IGNORE INTO reminder_log (telegram_id, kind, date, sent_at) VALUES (?, ?, ?, ?)",
+        (telegram_id, kind, day_iso, sent_at_iso_utc),
+    )
+
+
+async def send_with_compass(bot: Bot, telegram_id: int, text: str) -> bool:
+    try:
+        await bot.send_message(telegram_id, text, reply_markup=compass_kb())
+        return True
+    except (TelegramForbiddenError, TelegramBadRequest) as e:
+        log.warning("Send failed to %s: %s", telegram_id, e)
+        return False
+    except Exception as e:
+        log.exception("Unexpected send error to %s: %s", telegram_id, e)
+        return False
+
+
+# =========================
+# UI: настройки уведомлений
+# =========================
+def kb_notify_main(row: sqlite3.Row) -> InlineKeyboardMarkup:
+    on_checkin = "вкл" if int(row["enable_checkin"]) == 1 else "выкл"
+    on_checkout = "вкл" if int(row["enable_checkout"]) == 1 else "выкл"
+    on_askeza = "вкл" if int(row["enable_askeza"]) == 1 else "выкл"
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"Чек-ин: {on_checkin}", callback_data="nt:toggle:checkin"),
+            InlineKeyboardButton(text=f"Время: {row['checkin_time']}", callback_data="nt:settime:checkin"),
+        ],
+        [
+            InlineKeyboardButton(text=f"Чек-аут: {on_checkout}", callback_data="nt:toggle:checkout"),
+            InlineKeyboardButton(text=f"Время: {row['checkout_time']}", callback_data="nt:settime:checkout"),
+        ],
+        [
+            InlineKeyboardButton(text=f"Аскезы (все): {on_askeza}", callback_data="nt:toggle:askeza_master"),
+            InlineKeyboardButton(text="Мои аскезы", callback_data="nt:askeza:list"),
+        ],
+    ])
+
+
+def kb_askeza_list(items: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    rows = []
+    for r in items:
+        title = r["title"]
+        enabled = "вкл" if int(r["enabled"]) == 1 else "выкл"
+        t = r["time"]
+        aid = int(r["askeza_id"])
+        rows.append([
+            InlineKeyboardButton(text=f"{title} [{enabled}]", callback_data=f"nt:ask:toggle:{aid}"),
+            InlineKeyboardButton(text=f"время {t}", callback_data=f"nt:ask:settime:{aid}"),
+        ])
+
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="nt:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def fetch_notify_row(conn: sqlite3.Connection, telegram_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        """
+        SELECT
+          timezone,
+          checkin_time,
+          checkout_time,
+          enable_checkin,
+          enable_checkout,
+          enable_askeza
+        FROM notification_settings
+        WHERE telegram_id=?
+        """,
+        (telegram_id,),
+    ).fetchone()
+    return row
+
+
+def fetch_askeza_notify_rows(conn: sqlite3.Connection, telegram_id: int) -> list[sqlite3.Row]:
+    # гарантируем строки под активные аскезы
+    ensure_askeza_reminder_rows(conn, telegram_id)
+
+    rows = conn.execute(
+        """
+        SELECT
+          a.id   AS askeza_id,
+          a.title AS title,
+          r.time AS time,
+          r.enabled AS enabled
+        FROM askeza_entries a
+        JOIN askeza_reminder_settings r
+          ON r.telegram_id=a.telegram_id AND r.askeza_id=a.id
+        WHERE a.telegram_id=? AND a.is_active=1
+        ORDER BY a.id DESC
+        """,
+        (telegram_id,),
+    ).fetchall()
+    return list(rows)
+
+
+# =========================
+# Напоминания
+# =========================
+async def reminder_loop(bot: Bot):
+    """
+    Цикл работает только пока процесс бота запущен.
+    Для "всегда запущен" используйте systemd.
+    """
+    while True:
+        now_utc = datetime.now(timezone.utc)
+
+        try:
+            with db_connect() as conn:
+                users = conn.execute(
+                    """
+                    SELECT
+                      u.telegram_id,
+                      COALESCE(s.timezone, ?)            AS timezone,
+                      COALESCE(s.checkin_time, '12:00')  AS checkin_time,
+                      COALESCE(s.checkout_time, '21:00') AS checkout_time,
+                      COALESCE(s.enable_checkin, 1)      AS enable_checkin,
+                      COALESCE(s.enable_checkout, 1)     AS enable_checkout,
+                      COALESCE(s.enable_askeza, 1)       AS enable_askeza,
+                      s.quiet_start,
+                      s.quiet_end
+                    FROM users u
+                    LEFT JOIN notification_settings s ON s.telegram_id = u.telegram_id
+                    """,
+                    (DEFAULT_TZ,),
+                ).fetchall()
+
+                for u in users:
+                    telegram_id = int(u["telegram_id"])
+
+                    try:
+                        tz = ZoneInfo(u["timezone"])
+                    except Exception:
+                        tz = ZoneInfo(DEFAULT_TZ)
+
+                    now_local = now_utc.astimezone(tz)
+                    today = now_local.date().isoformat()
+
+                    if in_quiet_hours(now_local, u["quiet_start"], u["quiet_end"]):
+                        continue
+
+                    # Чек-ин => emotion_entries.type='morning'
+                    if int(u["enable_checkin"]) == 1:
+                        h, m = parse_hhmm(u["checkin_time"], "12:00")
+                        if in_one_minute_window(now_local, h, m):
+                            if not already_sent(conn, telegram_id, "checkin", today):
+                                if not emotion_entry_exists(conn, telegram_id, today, "morning"):
+                                    ok = await send_with_compass(bot, telegram_id, build_checkin_text())
+                                    if ok:
+                                        mark_sent(conn, telegram_id, "checkin", today, now_utc.isoformat())
+
+                    # Чек-аут => emotion_entries.type='evening'
+                    if int(u["enable_checkout"]) == 1:
+                        h, m = parse_hhmm(u["checkout_time"], "21:00")
+                        if in_one_minute_window(now_local, h, m):
+                            if not already_sent(conn, telegram_id, "checkout", today):
+                                if not emotion_entry_exists(conn, telegram_id, today, "evening"):
+                                    ok = await send_with_compass(bot, telegram_id, build_checkout_text())
+                                    if ok:
+                                        mark_sent(conn, telegram_id, "checkout", today, now_utc.isoformat())
+
+                    # Аскезы: мастер-переключатель + настройки по каждой
+                    if int(u["enable_askeza"]) == 1:
+                        ensure_askeza_reminder_rows(conn, telegram_id)
+
+                        rows = conn.execute(
+                            """
+                            SELECT
+                              r.askeza_id,
+                              r.time,
+                              r.enabled,
+                              a.title,
+                              a.duration,
+                              a.current_day
+                            FROM askeza_reminder_settings r
+                            JOIN askeza_entries a ON a.id=r.askeza_id
+                            WHERE r.telegram_id=? AND r.enabled=1 AND a.is_active=1
+                            ORDER BY a.id DESC
+                            """,
+                            (telegram_id,),
+                        ).fetchall()
+
+                        for r in rows:
+                            h, m = parse_hhmm(r["time"], "12:00")
+                            if not in_one_minute_window(now_local, h, m):
+                                continue
+
+                            kind = f"askeza:{int(r['askeza_id'])}"
+                            if already_sent(conn, telegram_id, kind, today):
+                                continue
+
+                            title = r["title"]
+                            cd = int(r["current_day"])
+                            dur = int(r["duration"])
+                            text = build_askeza_text(title, cd, dur)
+                            ok = await send_with_compass(bot, telegram_id, text)
+                            if ok:
+                                mark_sent(conn, telegram_id, kind, today, now_utc.isoformat())
+
+                conn.commit()
+
+        except Exception as e:
+            # чтобы цикл не умирал из-за временных проблем с БД/сетью
+            log.exception("reminder_loop error: %s", e)
+
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+
+
+# =========================
+# BOT HANDLERS
+# =========================
+dp = Dispatcher(storage=MemoryStorage())
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    tg_id = message.from_user.id
+
+    if not user_exists(tg_id):
+        await message.answer(MSG_START_NOT_REGISTERED, reply_markup=compass_kb())
+        return
+
+    ensure_notification_settings_row(tg_id)
+    await message.answer(MSG_START_REGISTERED, reply_markup=compass_kb())
+
+
+@dp.message(Command("mytime"))
+async def cmd_mytime(message: Message):
+    tg_id = message.from_user.id
+    try:
+        with db_connect() as conn:
+            ensure_notification_settings_row(tg_id)
+            row = conn.execute(
+                "SELECT timezone, checkin_time, checkout_time, enable_checkin, enable_checkout, enable_askeza FROM notification_settings WHERE telegram_id=?",
+                (tg_id,),
+            ).fetchone()
+
+            # Для вывода /mytime подтягиваем настройки всех активных аскез
+            ensure_askeza_reminder_rows(conn, tg_id)
+            askeza_rows = conn.execute(
+                """
+                SELECT
+                  a.id AS askeza_id,
+                  a.title AS title,
+                  a.duration AS duration,
+                  a.current_day AS current_day,
+                  COALESCE(r.time, '12:00') AS time,
+                  COALESCE(r.enabled, 1) AS enabled
+                FROM askeza_entries a
+                LEFT JOIN askeza_reminder_settings r
+                  ON r.telegram_id=a.telegram_id AND r.askeza_id=a.id
+                WHERE a.telegram_id=? AND a.is_active=1
+                ORDER BY a.id DESC
+                """,
+                (tg_id,),
+            ).fetchall()
+            conn.commit()
+    except sqlite3.OperationalError:
+        await message.answer(MSG_NOTIFY_DB_ERROR, reply_markup=compass_kb())
+        return
+
+    if not row:
+        await message.answer(MSG_MYTIME_NOT_FOUND, reply_markup=compass_kb())
+        return
+
+    lines = [
+        f"Чек-ин: {row['checkin_time']} ({'on' if int(row['enable_checkin'])==1 else 'off'})",
+        f"Чек-аут: {row['checkout_time']} ({'on' if int(row['enable_checkout'])==1 else 'off'})",
+        f"Аскезы: {'on' if int(row['enable_askeza'])==1 else 'off'}",
+    ]
+
+    if askeza_rows:
+        lines.append("\nАскезы:")
+        for a in askeza_rows:
+            title = a["title"]
+            enabled = "✅" if int(a["enabled"]) == 1 else "❌"
+            t = a["time"]
+            dur = max(int(a["duration"] or 1), 1)
+            day = min(max(int(a["current_day"] or 0) + 1, 1), dur)
+            lines.append(f"- {title}: {t} ({enabled}) ☀️ день {day}/{dur}")
+    else:
+        lines.append("\naskes: none")
+
+    lines.append("\nНастройка: /notifications")
+    txt = "\n".join(lines)
+    await message.answer(txt, reply_markup=compass_kb())
+
+
+@dp.message(Command("notifications"))
+async def cmd_notifications(message: Message):
+    tg_id = message.from_user.id
+    if not user_exists(tg_id):
+        await message.answer(MSG_START_NOT_REGISTERED, reply_markup=compass_kb())
+        return
+
+    try:
+        with db_connect() as conn:
+            ensure_notification_settings_row(tg_id)
+            row = fetch_notify_row(conn, tg_id)
+            conn.commit()
+    except sqlite3.OperationalError:
+        await message.answer(MSG_NOTIFY_DB_ERROR, reply_markup=compass_kb())
+        return
+
+    await message.answer(MSG_NOTIFY_HEADER, reply_markup=kb_notify_main(row))
+
+
+@dp.callback_query(F.data == "nt:main")
+async def cb_nt_main(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    try:
+        with db_connect() as conn:
+            ensure_notification_settings_row(tg_id)
+            row = fetch_notify_row(conn, tg_id)
+            conn.commit()
+    except sqlite3.OperationalError:
+        await callback.answer("DB error", show_alert=True)
+        return
+
+    await callback.message.edit_text(MSG_NOTIFY_HEADER, reply_markup=kb_notify_main(row))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("nt:toggle:"))
+async def cb_nt_toggle(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    kind = callback.data.split(":")[-1]  # checkin/checkout/askeza_master
+
+    try:
+        with db_connect() as conn:
+            ensure_notification_settings_row(tg_id)
+
+            if kind == "checkin":
+                conn.execute(
+                    "UPDATE notification_settings SET enable_checkin = 1 - enable_checkin, updated_at=datetime('now') WHERE telegram_id=?",
+                    (tg_id,),
+                )
+            elif kind == "checkout":
+                conn.execute(
+                    "UPDATE notification_settings SET enable_checkout = 1 - enable_checkout, updated_at=datetime('now') WHERE telegram_id=?",
+                    (tg_id,),
+                )
+            elif kind == "askeza_master":
+                conn.execute(
+                    "UPDATE notification_settings SET enable_askeza = 1 - enable_askeza, updated_at=datetime('now') WHERE telegram_id=?",
+                    (tg_id,),
+                )
+
+            row = fetch_notify_row(conn, tg_id)
+            conn.commit()
+    except sqlite3.OperationalError:
+        await callback.answer("DB error", show_alert=True)
+        return
+
+    await callback.message.edit_text(MSG_NOTIFY_HEADER, reply_markup=kb_notify_main(row))
+    await callback.answer("Готово")
+
+
+@dp.callback_query(F.data.startswith("nt:settime:"))
+async def cb_nt_set_time(callback: CallbackQuery, state: FSMContext):
+    kind = callback.data.split(":")[-1]  # checkin/checkout
+    await state.set_state(NotifyStates.waiting_time)
+    await state.update_data(target_kind=kind)
+    await callback.message.answer(MSG_NOTIFY_TIME_PROMPT)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "nt:askeza:list")
+async def cb_nt_askeza_list(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    try:
+        with db_connect() as conn:
+            ensure_notification_settings_row(tg_id)
+            items = fetch_askeza_notify_rows(conn, tg_id)
+            conn.commit()
+    except sqlite3.OperationalError:
+        await callback.answer("DB error", show_alert=True)
+        return
+
+    if not items:
+        await callback.message.edit_text("У вас пока нет активных аскез.", reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="nt:main")]]
+        ))
+        await callback.answer()
+        return
+
+    await callback.message.edit_text("Мои аскезы ~ уведомления:", reply_markup=kb_askeza_list(items))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("nt:ask:toggle:"))
+async def cb_nt_askeza_toggle(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    askeza_id = int(callback.data.split(":")[-1])
+
+    try:
+        with db_connect() as conn:
+            ensure_notification_settings_row(tg_id)
+            ensure_askeza_reminder_rows(conn, tg_id)
+
+            conn.execute(
+                "UPDATE askeza_reminder_settings SET enabled = 1 - enabled, updated_at=datetime('now') WHERE telegram_id=? AND askeza_id=?",
+                (tg_id, askeza_id),
+            )
+            items = fetch_askeza_notify_rows(conn, tg_id)
+            conn.commit()
+    except sqlite3.OperationalError:
+        await callback.answer("DB error", show_alert=True)
+        return
+
+    await callback.message.edit_text("Мои аскезы ~ уведомления:", reply_markup=kb_askeza_list(items))
+    await callback.answer("Готово")
+
+
+@dp.callback_query(F.data.startswith("nt:ask:settime:"))
+async def cb_nt_askeza_set_time(callback: CallbackQuery, state: FSMContext):
+    askeza_id = int(callback.data.split(":")[-1])
+    await state.set_state(NotifyStates.waiting_time)
+    await state.update_data(target_kind="askeza", askeza_id=askeza_id)
+    await callback.message.answer(MSG_NOTIFY_TIME_PROMPT)
+    await callback.answer()
+
+
+@dp.message(NotifyStates.waiting_time)
+async def nt_receive_time(message: Message, state: FSMContext):
+    tg_id = message.from_user.id
+    txt = (message.text or "").strip()
+
+    if not hhmm_is_valid(txt):
+        await message.answer(MSG_NOTIFY_BAD_TIME)
+        return
+
+    data = await state.get_data()
+    target_kind = data.get("target_kind")
+    askeza_id = data.get("askeza_id")
+
+    try:
+        with db_connect() as conn:
+            ensure_notification_settings_row(tg_id)
+
+            if target_kind == "checkin":
+                conn.execute(
+                    "UPDATE notification_settings SET checkin_time=?, updated_at=datetime('now') WHERE telegram_id=?",
+                    (txt, tg_id),
+                )
+                row = fetch_notify_row(conn, tg_id)
+                conn.commit()
+                await message.answer("Сохранено.", reply_markup=kb_notify_main(row))
+
+            elif target_kind == "checkout":
+                conn.execute(
+                    "UPDATE notification_settings SET checkout_time=?, updated_at=datetime('now') WHERE telegram_id=?",
+                    (txt, tg_id),
+                )
+                row = fetch_notify_row(conn, tg_id)
+                conn.commit()
+                await message.answer("Сохранено.", reply_markup=kb_notify_main(row))
+
+            elif target_kind == "askeza" and askeza_id is not None:
+                ensure_askeza_reminder_rows(conn, tg_id)
+                conn.execute(
+                    "UPDATE askeza_reminder_settings SET time=?, updated_at=datetime('now') WHERE telegram_id=? AND askeza_id=?",
+                    (txt, tg_id, int(askeza_id)),
+                )
+                items = fetch_askeza_notify_rows(conn, tg_id)
+                conn.commit()
+                await message.answer("Сохранено.", reply_markup=kb_askeza_list(items))
+            else:
+                await message.answer("Не понял, что настраиваем. Откройте /notifications")
+    except sqlite3.OperationalError:
+        await message.answer(MSG_NOTIFY_DB_ERROR, reply_markup=compass_kb())
+        return
+    finally:
+        await state.clear()
+
+
+async def main():
+    ensure_tables()
+    bot = Bot(token=BOT_TOKEN)
+
+    # Запуск напоминаний
+    asyncio.create_task(reminder_loop(bot))
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,359 @@
+import os
+import asyncio
+import logging
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from aiogram import Bot, Dispatcher
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+
+
+# =========================
+# НАСТРОЙКИ ЧЕРЕЗ ENV
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DB_PATH = os.getenv("DB_PATH", "compass.db").strip()
+APP_URL = os.getenv("APP_URL", "").strip()  # ссылка на COMPASS (обязательно)
+DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Europe/Moscow").strip()
+POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "20"))
+
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN")
+if not APP_URL:
+    raise RuntimeError("Не задан APP_URL (ссылка на приложение COMPASS)")
+
+
+# =========================
+# ТЕКСТЫ СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯМ
+# =========================
+MSG_START_REGISTERED = (
+    "Вы в системе. Напоминания включены.\n"
+    "Чек-ин в 12:00 (если записи нет), чек-аут в 21:00 (если записи нет), аскеза по расписанию.\n"
+    "Открывайте COMPASS по кнопке ниже."
+)
+
+MSG_START_NOT_REGISTERED = (
+    "Я вижу, что вы ещё не зарегистрированы в COMPASS.\n"
+    "Откройте приложение по кнопке ниже и пройдите регистрацию. После этого напоминания начнут работать."
+)
+
+MSG_MYTIME_NOT_FOUND = "Настройки уведомлений не найдены. Сначала зарегистрируйтесь в COMPASS и нажмите /start."
+
+MSG_CHECKIN_REMINDER = "Чек-ин: отметьте состояние в COMPASS."
+MSG_CHECKOUT_REMINDER = "Чек-аут: зафиксируйте итог дня в COMPASS."
+MSG_ASKEZA_HEADER = "Напоминание по аскезе:"
+
+
+# =========================
+# ЛОГИ
+# =========================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("compass_tg_bot")
+
+
+# =========================
+# DB
+# =========================
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def ensure_tables():
+    """
+    Создаём только то, что нужно для напоминаний.
+    Таблицы users/emotion_entries/askeza_entries у вас уже есть (и с NOT NULL полями),
+    поэтому их НЕ трогаем.
+    """
+    with db_connect() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS notification_settings (
+          telegram_id INTEGER PRIMARY KEY,
+          timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
+
+          checkin_time  TEXT NOT NULL DEFAULT '12:00',
+          checkout_time TEXT NOT NULL DEFAULT '21:00',
+          askeza_time   TEXT NOT NULL DEFAULT '12:00',
+
+          enable_checkin  INTEGER NOT NULL DEFAULT 1,
+          enable_checkout INTEGER NOT NULL DEFAULT 1,
+          enable_askeza   INTEGER NOT NULL DEFAULT 1,
+
+          quiet_start TEXT DEFAULT NULL,
+          quiet_end   TEXT DEFAULT NULL,
+
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+          FOREIGN KEY (telegram_id) REFERENCES users (telegram_id) ON DELETE CASCADE
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS reminder_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          telegram_id INTEGER NOT NULL,
+          kind TEXT NOT NULL,    -- 'checkin' | 'checkout' | 'askeza'
+          date TEXT NOT NULL,    -- YYYY-MM-DD (локальная дата пользователя)
+          sent_at TEXT NOT NULL, -- ISO UTC
+          UNIQUE(telegram_id, kind, date)
+        )
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_reminder_log_tgd_kind_date
+        ON reminder_log (telegram_id, kind, date)
+        """)
+        conn.commit()
+
+
+def user_exists(telegram_id: int) -> bool:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM users WHERE telegram_id=? LIMIT 1",
+            (telegram_id,),
+        ).fetchone()
+        return row is not None
+
+
+def ensure_notification_settings_row(telegram_id: int):
+    """
+    Создаём настройки только если пользователь уже есть в users.
+    Иначе FK не позволит (и это правильно).
+    """
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO notification_settings (telegram_id, created_at, updated_at)
+            VALUES (?, datetime('now'), datetime('now'))
+        """, (telegram_id,))
+        conn.commit()
+
+
+# =========================
+# UI: КНОПКА "Открыть COMPASS"
+# =========================
+def compass_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Открыть COMPASS", url=APP_URL)]
+    ])
+
+
+async def send_with_compass(bot: Bot, telegram_id: int, text: str) -> bool:
+    try:
+        await bot.send_message(chat_id=telegram_id, text=text, reply_markup=compass_kb())
+        return True
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return False
+    except Exception:
+        return False
+
+
+# =========================
+# REMINDERS
+# =========================
+def parse_hhmm(value: str | None, default: str) -> tuple[int, int]:
+    v = (value or default).strip()
+    try:
+        hh, mm = v.split(":")
+        return int(hh), int(mm)
+    except Exception:
+        hh, mm = default.split(":")
+        return int(hh), int(mm)
+
+
+def in_one_minute_window(now_local: datetime, hh: int, mm: int) -> bool:
+    target = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return timedelta(0) <= (now_local - target) < timedelta(minutes=1)
+
+
+def in_quiet_hours(now_local: datetime, quiet_start: str | None, quiet_end: str | None) -> bool:
+    if not quiet_start or not quiet_end:
+        return False
+    sh, sm = parse_hhmm(quiet_start, "00:00")
+    eh, em = parse_hhmm(quiet_end, "00:00")
+
+    start = now_local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end = now_local.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    # тихие часы пересекают полночь
+    if end <= start:
+        return now_local >= start or now_local < end
+    return start <= now_local < end
+
+
+def already_sent(conn, telegram_id: int, kind: str, date_str: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM reminder_log WHERE telegram_id=? AND kind=? AND date=? LIMIT 1",
+        (telegram_id, kind, date_str),
+    ).fetchone()
+    return row is not None
+
+
+def mark_sent(conn, telegram_id: int, kind: str, date_str: str, sent_at_iso: str):
+    conn.execute(
+        "INSERT OR IGNORE INTO reminder_log (telegram_id, kind, date, sent_at) VALUES (?,?,?,?)",
+        (telegram_id, kind, date_str, sent_at_iso),
+    )
+    conn.commit()
+
+
+def has_emotion_entry(conn, telegram_id: int, date_str: str, entry_type: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM emotion_entries WHERE telegram_id=? AND date=? AND type=? LIMIT 1",
+        (telegram_id, date_str, entry_type),
+    ).fetchone()
+    return row is not None
+
+
+def get_active_askezas(conn, telegram_id: int):
+    return conn.execute(
+        """
+        SELECT title, current_day, duration
+        FROM askeza_entries
+        WHERE telegram_id=? AND is_active=1 AND current_day < duration
+        """,
+        (telegram_id,),
+    ).fetchall()
+
+
+async def reminder_loop(bot: Bot):
+    """
+    Цикл работает только пока процесс бота запущен.
+    Для "всегда запущен" используйте systemd (см. compass-bot.service).
+    """
+    while True:
+        now_utc = datetime.now(timezone.utc)
+
+        with db_connect() as conn:
+            users = conn.execute(
+                """
+                SELECT
+                  u.telegram_id,
+                  COALESCE(s.timezone, ?)             AS timezone,
+                  COALESCE(s.checkin_time, '12:00')   AS checkin_time,
+                  COALESCE(s.checkout_time, '21:00')  AS checkout_time,
+                  COALESCE(s.askeza_time, '12:00')    AS askeza_time,
+                  COALESCE(s.enable_checkin, 1)       AS enable_checkin,
+                  COALESCE(s.enable_checkout, 1)      AS enable_checkout,
+                  COALESCE(s.enable_askeza, 1)        AS enable_askeza,
+                  s.quiet_start,
+                  s.quiet_end
+                FROM users u
+                LEFT JOIN notification_settings s ON s.telegram_id = u.telegram_id
+                """,
+                (DEFAULT_TZ,),
+            ).fetchall()
+
+            for u in users:
+                telegram_id = int(u["telegram_id"])
+
+                try:
+                    tz = ZoneInfo(u["timezone"])
+                except Exception:
+                    tz = ZoneInfo(DEFAULT_TZ)
+
+                now_local = now_utc.astimezone(tz)
+                today = now_local.date().isoformat()
+
+                if in_quiet_hours(now_local, u["quiet_start"], u["quiet_end"]):
+                    continue
+
+                # Чек-ин (12:00) => emotion_entries.type='morning'
+                if int(u["enable_checkin"]) == 1:
+                    h, m = parse_hhmm(u["checkin_time"], "12:00")
+                    if in_one_minute_window(now_local, h, m):
+                        if (not already_sent(conn, telegram_id, "checkin", today)) and (
+                            not has_emotion_entry(conn, telegram_id, today, "morning")
+                        ):
+                            ok = await send_with_compass(bot, telegram_id, MSG_CHECKIN_REMINDER)
+                            if ok:
+                                mark_sent(conn, telegram_id, "checkin", today, now_utc.isoformat())
+
+                # Чек-аут (21:00) => emotion_entries.type='evening'
+                if int(u["enable_checkout"]) == 1:
+                    h, m = parse_hhmm(u["checkout_time"], "21:00")
+                    if in_one_minute_window(now_local, h, m):
+                        if (not already_sent(conn, telegram_id, "checkout", today)) and (
+                            not has_emotion_entry(conn, telegram_id, today, "evening")
+                        ):
+                            ok = await send_with_compass(bot, telegram_id, MSG_CHECKOUT_REMINDER)
+                            if ok:
+                                mark_sent(conn, telegram_id, "checkout", today, now_utc.isoformat())
+
+                # Аскеза (по askeza_time) + список активных
+                if int(u["enable_askeza"]) == 1:
+                    h, m = parse_hhmm(u["askeza_time"], "12:00")
+                    if in_one_minute_window(now_local, h, m):
+                        if not already_sent(conn, telegram_id, "askeza", today):
+                            active = get_active_askezas(conn, telegram_id)
+                            if active:
+                                lines = []
+                                for a in active:
+                                    title = a["title"]
+                                    cd = int(a["current_day"])
+                                    dur = int(a["duration"])
+                                    lines.append(f"- {title}: день {min(cd + 1, dur)}/{dur}")
+                                text = MSG_ASKEZA_HEADER + "\n" + "\n".join(lines)
+                                ok = await send_with_compass(bot, telegram_id, text)
+                                if ok:
+                                    mark_sent(conn, telegram_id, "askeza", today, now_utc.isoformat())
+
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+
+
+# =========================
+# BOT HANDLERS
+# =========================
+dp = Dispatcher()
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    tg_id = message.from_user.id
+
+    if not user_exists(tg_id):
+        await message.answer(MSG_START_NOT_REGISTERED, reply_markup=compass_kb())
+        return
+
+    ensure_notification_settings_row(tg_id)
+    await message.answer(MSG_START_REGISTERED, reply_markup=compass_kb())
+
+
+@dp.message(Command("mytime"))
+async def cmd_mytime(message: Message):
+    tg_id = message.from_user.id
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT timezone, checkin_time, checkout_time, askeza_time FROM notification_settings WHERE telegram_id=?",
+            (tg_id,),
+        ).fetchone()
+
+    if not row:
+        await message.answer(MSG_MYTIME_NOT_FOUND, reply_markup=compass_kb())
+        return
+
+    txt = (
+        f"timezone: {row['timezone']}\n"
+        f"checkin_time: {row['checkin_time']}\n"
+        f"checkout_time: {row['checkout_time']}\n"
+        f"askeza_time: {row['askeza_time']}"
+    )
+    await message.answer(txt, reply_markup=compass_kb())
+
+
+async def main():
+    ensure_tables()
+
+    bot = Bot(token=BOT_TOKEN)
+
+    # Запуск напоминаний
+    asyncio.create_task(reminder_loop(bot))
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
