@@ -1,15 +1,14 @@
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import BottomNavigation from '../../components/feature/BottomNavigation';
 import EmotionChart from '../../components/feature/EmotionChart';
 import AskezaCompletionMenu from '../../components/feature/AskezaCompletionMenu';
-// import DynamicBackground from '../../components/feature/DynamicBackground';
 import WidgetMenu from '../../components/feature/WidgetMenu';
 import MeditationModal from '../../components/feature/MeditationModal';
 import { dbManager, getTelegramUserId, getTelegramUserData, type UserProfile } from '../../utils/database';
 import NeonButton from '../../components/base/NeonButton';
 
-// === Added: background types/helpers ===
+// === Background types/helpers ===
 type TimeOfDay = 'morning' | 'day' | 'evening' | 'night';
 
 function getTimeOfDay(date = new Date()): TimeOfDay {
@@ -20,281 +19,215 @@ function getTimeOfDay(date = new Date()): TimeOfDay {
   return 'night';
 }
 
-const BG_PALETTE: Record<TimeOfDay, {
-  skyA: string;
-  skyB: string;
-  glow: string;
-  sunMoonA: string;
-  sunMoonB: string;
-  ridgeA: string;
-  ridgeB: string;
-  peakA: string;
-  peakB: string;
-  forestA: string;
-  forestB: string;
-  haze: string;
-}> = {
-  morning: {
-    skyA: '#081428',
-    skyB: '#2C6C8F',
-    glow: '#F7B37A',
-    sunMoonA: '#FFE7B7',
-    sunMoonB: '#FFC37A',
-    ridgeA: '#1B2744',
-    ridgeB: '#2B325A',
-    peakA: '#3A2A58',
-    peakB: '#6A3C5E',
-    forestA: '#071B1D',
-    forestB: '#0F2A2D',
-    haze: '#BFE7FF',
-  },
-  day: {
-    skyA: '#06142A',
-    skyB: '#2E7BC8',
-    glow: '#A6E6FF',
-    sunMoonA: '#FFF7C9',
-    sunMoonB: '#FFD79A',
-    ridgeA: '#13243F',
-    ridgeB: '#203B5D',
-    peakA: '#2A2F5E',
-    peakB: '#3D5A7A',
-    forestA: '#061A17',
-    forestB: '#0C2724',
-    haze: '#D6F4FF',
-  },
-  evening: {
-    skyA: '#120829',
-    skyB: '#6D2A66',
-    glow: '#FF9A8A',
-    sunMoonA: '#FFD1B8',
-    sunMoonB: '#FF8D7A',
-    ridgeA: '#1A1736',
-    ridgeB: '#2B1E4F',
-    peakA: '#3B1F57',
-    peakB: '#7A3B64',
-    forestA: '#071215',
-    forestB: '#0E1F24',
-    haze: '#FFD7C8',
-  },
-  night: {
-    skyA: '#040614',
-    skyB: '#101B3D',
-    glow: '#7EC8FF',
-    sunMoonA: '#F3F0FF',
-    sunMoonB: '#B8B8FF',
-    ridgeA: '#0A1230',
-    ridgeB: '#12214A',
-    peakA: '#0E1034',
-    peakB: '#1E2A5C',
-    forestA: '#030C0F',
-    forestB: '#071418',
-    haze: '#B6D6FF',
-  },
-};
-
-function hashStringToSeed(str: string) {
-  // small deterministic hash → 32-bit seed
-  let h = 2166136261;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
+// Вычисление реальной фазы луны (0 = новолуние, 0.5 = полнолуние)
+function getMoonPhase(date = new Date()): number {
+  const LUNAR_CYCLE = 29.53059;
+  const KNOWN_NEW_MOON = new Date('2024-01-11T11:57:00Z').getTime();
+  const diff = date.getTime() - KNOWN_NEW_MOON;
+  const days = diff / (1000 * 60 * 60 * 24);
+  const phase = (days % LUNAR_CYCLE) / LUNAR_CYCLE;
+  return phase < 0 ? phase + 1 : phase;
 }
 
-function mulberry32(seed: number) {
-  return function () {
-    let t = (seed += 0x6d2b79f5);
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+// Расчёт даты следующего полнолуния
+function getNextFullMoon(date = new Date()): Date {
+  const LUNAR_CYCLE = 29.53059;
+  const KNOWN_FULL_MOON = new Date('2024-12-15T09:02:00Z').getTime();
+  const diff = date.getTime() - KNOWN_FULL_MOON;
+  const daysSinceFull = diff / (1000 * 60 * 60 * 24);
+  const cyclePosition = daysSinceFull % LUNAR_CYCLE;
+  const daysUntilNext = cyclePosition < 0 ? -cyclePosition : (LUNAR_CYCLE - cyclePosition);
+  return new Date(date.getTime() + daysUntilNext * 24 * 60 * 60 * 1000);
 }
 
+// Получение названия фазы луны на русском
+function getMoonPhaseName(phase: number): { name: string; isWaxing: boolean } {
+  if (phase < 0.03 || phase > 0.97) return { name: 'Новолуние', isWaxing: true };
+  if (phase < 0.22) return { name: 'Растущий серп', isWaxing: true };
+  if (phase < 0.28) return { name: 'Первая четверть', isWaxing: true };
+  if (phase < 0.47) return { name: 'Растущая луна', isWaxing: true };
+  if (phase < 0.53) return { name: 'Полнолуние', isWaxing: false };
+  if (phase < 0.72) return { name: 'Убывающая луна', isWaxing: false };
+  if (phase < 0.78) return { name: 'Последняя четверть', isWaxing: false };
+  return { name: 'Убывающий серп', isWaxing: false };
+}
+
+// Анимированный фон на чистом CSS
 function BackgroundLayer({ timeOfDay }: { timeOfDay: TimeOfDay }) {
-  const p = BG_PALETTE[timeOfDay];
+  // Палитры для каждого времени суток в пастельных тонах
+  const palettes = {
+    morning: {
+      sky: ['#1a1a2e', '#16213e', '#1f4068', '#7b2cbf'],
+      orbs: ['rgba(255, 182, 193, 0.4)', 'rgba(255, 218, 185, 0.3)', 'rgba(255, 160, 122, 0.25)'],
+      glow: 'rgba(255, 183, 77, 0.15)',
+      stars: false,
+    },
+    day: {
+      sky: ['#0f172a', '#1e3a5f', '#2563eb', '#60a5fa'],
+      orbs: ['rgba(147, 197, 253, 0.3)', 'rgba(196, 181, 253, 0.25)', 'rgba(167, 243, 208, 0.2)'],
+      glow: 'rgba(96, 165, 250, 0.1)',
+      stars: false,
+    },
+    evening: {
+      sky: ['#0f0f1a', '#1a0a2e', '#4a1942', '#c2185b'],
+      orbs: ['rgba(255, 105, 135, 0.35)', 'rgba(255, 183, 77, 0.3)', 'rgba(186, 104, 200, 0.25)'],
+      glow: 'rgba(255, 138, 101, 0.15)',
+      stars: true,
+    },
+    night: {
+      sky: ['#020617', '#0f172a', '#1e293b', '#334155'],
+      orbs: ['rgba(99, 102, 241, 0.3)', 'rgba(139, 92, 246, 0.25)', 'rgba(59, 130, 246, 0.2)'],
+      glow: 'rgba(99, 102, 241, 0.1)',
+      stars: true,
+    },
+  };
 
-  const stars = useMemo(() => {
-    if (timeOfDay !== 'night' && timeOfDay !== 'evening') return [];
-    const rand = mulberry32(hashStringToSeed(`stars:${timeOfDay}`));
-    const count = timeOfDay === 'night' ? 90 : 55;
-    return Array.from({ length: count }).map((_, i) => {
-      const x = rand() * 100;
-      const y = rand() * 55;
-      const s = 1 + rand() * 2.2;
-      const o = 0.25 + rand() * 0.55;
-      const d = 2 + rand() * 4;
-      const a = 1.5 + rand() * 2.5;
-      return { id: i, x, y, s, o, d, a };
-    });
-  }, [timeOfDay]);
-
-  const clouds = useMemo(() => {
-    if (timeOfDay !== 'morning' && timeOfDay !== 'day') return [];
-    const rand = mulberry32(hashStringToSeed(`clouds:${timeOfDay}`));
-    const count = timeOfDay === 'day' ? 5 : 6;
-    return Array.from({ length: count }).map((_, i) => {
-      const x = 5 + rand() * 90;
-      const y = 5 + rand() * 35;
-      const w = 180 + rand() * 260;
-      const h = 60 + rand() * 120;
-      const o = 0.08 + rand() * 0.12;
-      return { id: i, x, y, w, h, o };
-    });
-  }, [timeOfDay]);
+  const palette = palettes[timeOfDay];
 
   return (
-    <div className="fixed inset-0 -z-10" style={{ pointerEvents: 'none', contain: 'paint' }} aria-hidden>
-      {/* Sky */}
-      <div
-        className="absolute inset-0"
-        style={{
-          background: `radial-gradient(800px 520px at 50% 18%, ${p.glow}55 0%, transparent 60%),
-                       radial-gradient(900px 700px at 15% 20%, ${p.glow}22 0%, transparent 55%),
-                       linear-gradient(180deg, ${p.skyA} 0%, ${p.skyB} 55%, ${p.ridgeA} 100%)`,
-        }}
-      />
-
-      {/* Soft grain (very light) */}
-      <div
-        className="absolute inset-0 opacity-[0.06] mix-blend-overlay"
-        style={{
-          backgroundImage:
-            'repeating-linear-gradient(0deg, rgba(255,255,255,0.12) 0px, rgba(255,255,255,0.12) 1px, transparent 1px, transparent 3px)',
-        }}
-      />
-
-      {/* Sun / Moon */}
-      <div
-        className="absolute left-1/2 top-[6%] -translate-x-1/2 rounded-full"
-        style={{
-          width: timeOfDay === 'night' ? 220 : 260,
-          height: timeOfDay === 'night' ? 220 : 260,
-          background: `radial-gradient(circle at 35% 30%, ${p.sunMoonA} 0%, ${p.sunMoonB} 65%, transparent 72%)`,
-          filter: 'blur(0px)',
-          boxShadow: `0 0 60px ${p.glow}55, 0 0 140px ${p.glow}33`,
-          opacity: timeOfDay === 'day' ? 0.95 : timeOfDay === 'morning' ? 0.92 : timeOfDay === 'evening' ? 0.88 : 0.85,
-        }}
-      />
-
-      {/* Clouds (morning/day) */}
-      {clouds.map(c => (
+    <>
+      <div className="fixed inset-0 -z-20 overflow-hidden" style={{ pointerEvents: 'none' }} aria-hidden>
+        {/* Основной градиент неба */}
         <div
-          key={c.id}
-          className="absolute rounded-full blur-3xl"
+          className="absolute inset-0 transition-all duration-[3000ms]"
           style={{
-            left: `${c.x}%`,
-            top: `${c.y}%`,
-            width: `${c.w}px`,
-            height: `${c.h}px`,
-            background: `radial-gradient(circle at 30% 30%, rgba(255,255,255,0.65) 0%, rgba(255,255,255,0.0) 70%)`,
-            opacity: c.o,
-            transform: 'translate(-50%, -50%)',
+            background: `linear-gradient(180deg, ${palette.sky[0]} 0%, ${palette.sky[1]} 30%, ${palette.sky[2]} 60%, ${palette.sky[3]} 100%)`,
           }}
         />
-      ))}
 
-      {/* Stars (evening/night) */}
-      {stars.map(s => (
-        <span
-          key={s.id}
-          className="absolute rounded-full"
+        {/* Анимированные пастельные орбы */}
+        <div
+          className="absolute w-[600px] h-[600px] rounded-full blur-[120px] animate-[float1_20s_ease-in-out_infinite]"
           style={{
-            left: `${s.x}%`,
-            top: `${s.y}%`,
-            width: `${s.s}px`,
-            height: `${s.s}px`,
-            background: 'rgba(255,255,255,0.95)',
-            opacity: s.o,
-            boxShadow: '0 0 10px rgba(180,220,255,0.45)',
-            animation: `twinkle ${s.d}s ease-in-out ${s.a}s infinite alternate`,
+            background: palette.orbs[0],
+            top: '-10%',
+            right: '-15%',
           }}
         />
-      ))}
-
-      {/* Mountains + forest (SVG illustration) */}
-      <svg
-        className="absolute inset-x-0 bottom-0 h-[62%] w-full"
-        viewBox="0 0 1440 900"
-        preserveAspectRatio="none"
-      >
-        <defs>
-          <linearGradient id="ridge" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={p.ridgeB} stopOpacity="1" />
-            <stop offset="100%" stopColor={p.ridgeA} stopOpacity="1" />
-          </linearGradient>
-          <linearGradient id="peaks" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={p.peakB} stopOpacity="1" />
-            <stop offset="100%" stopColor={p.peakA} stopOpacity="1" />
-          </linearGradient>
-          <linearGradient id="forest" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={p.forestB} stopOpacity="1" />
-            <stop offset="100%" stopColor={p.forestA} stopOpacity="1" />
-          </linearGradient>
-          <linearGradient id="mist" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={p.haze} stopOpacity="0.35" />
-            <stop offset="100%" stopColor={p.haze} stopOpacity="0" />
-          </linearGradient>
-          <filter id="softBlur" x="-20%" y="-20%" width="140%" height="140%">
-            <feGaussianBlur stdDeviation="8" />
-          </filter>
-        </defs>
-
-        {/* far ridge */}
-        <path
-          d="M0,560 C120,520 210,530 330,500 C470,466 570,410 710,430 C860,450 980,390 1120,420 C1270,460 1340,430 1440,410 L1440,900 L0,900 Z"
-          fill="url(#ridge)"
-          opacity="0.85"
+        <div
+          className="absolute w-[500px] h-[500px] rounded-full blur-[100px] animate-[float2_25s_ease-in-out_infinite]"
+          style={{
+            background: palette.orbs[1],
+            bottom: '20%',
+            left: '-20%',
+          }}
         />
-        {/* main peaks */}
-        <path
-          d="M0,640 C140,600 230,620 350,585 C500,540 590,445 720,480 C860,520 960,420 1085,470 C1220,525 1320,505 1440,470 L1440,900 L0,900 Z"
-          fill="url(#peaks)"
-          opacity="0.92"
-        />
-        {/* highlight snow-ish on peaks (subtle) */}
-        <path
-          d="M265,610 C350,560 420,520 485,520 C540,520 585,545 630,570 C560,545 520,565 480,585 C415,615 360,625 265,610 Z"
-          fill="rgba(255,255,255,0.10)"
-        />
-        <path
-          d="M805,540 C865,505 920,475 980,480 C1035,485 1085,520 1130,545 C1055,510 1010,525 960,545 C910,570 865,565 805,540 Z"
-          fill="rgba(255,255,255,0.09)"
+        <div
+          className="absolute w-[400px] h-[400px] rounded-full blur-[80px] animate-[float3_18s_ease-in-out_infinite]"
+          style={{
+            background: palette.orbs[2],
+            top: '40%',
+            right: '10%',
+          }}
         />
 
-        {/* mist band */}
-        <rect x="0" y="560" width="1440" height="180" fill="url(#mist)" filter="url(#softBlur)" />
-
-        {/* forest silhouette */}
-        <path
-          d="M0,730 C110,690 210,710 320,680 C450,645 565,670 690,640 C815,610 925,655 1050,625 C1185,595 1310,640 1440,610 L1440,900 L0,900 Z"
-          fill="url(#forest)"
-          opacity="0.98"
+        {/* Центральное свечение */}
+        <div
+          className="absolute w-[800px] h-[400px] rounded-full blur-[150px] animate-[pulse-glow_8s_ease-in-out_infinite]"
+          style={{
+            background: palette.glow,
+            top: '60%',
+            left: '50%',
+            transform: 'translateX(-50%)',
+          }}
         />
-      </svg>
 
-      {/* Bottom glassy haze like in refs */}
-      <div
-        className="absolute inset-x-0 bottom-0 h-[28%]"
-        style={{
-          background: `linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.35) 55%, rgba(0,0,0,0.55) 100%)`,
-        }}
-      />
+        {/* Звёзды для вечера и ночи */}
+        {palette.stars && (
+          <div className="absolute inset-0">
+            {[...Array(50)].map((_, i) => (
+              <div
+                key={i}
+                className="absolute rounded-full bg-white animate-[twinkle_3s_ease-in-out_infinite]"
+                style={{
+                  width: `${1 + Math.random() * 2}px`,
+                  height: `${1 + Math.random() * 2}px`,
+                  top: `${Math.random() * 60}%`,
+                  left: `${Math.random() * 100}%`,
+                  opacity: 0.3 + Math.random() * 0.5,
+                  animationDelay: `${Math.random() * 3}s`,
+                }}
+              />
+            ))}
+          </div>
+        )}
 
-      {/* Vignette for readability */}
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_0%,rgba(0,0,0,0.35)_65%,rgba(0,0,0,0.6)_100%)]" />
+        {/* Волнистые линии света */}
+        <svg className="absolute inset-0 w-full h-full opacity-[0.03]" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="wave-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stopColor="white" stopOpacity="0" />
+              <stop offset="50%" stopColor="white" stopOpacity="1" />
+              <stop offset="100%" stopColor="white" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          <path
+            d="M0,400 Q200,350 400,400 T800,400 T1200,400"
+            stroke="url(#wave-gradient)"
+            strokeWidth="1"
+            fill="none"
+            className="animate-[wave-move_15s_linear_infinite]"
+          />
+          <path
+            d="M0,500 Q200,450 400,500 T800,500 T1200,500"
+            stroke="url(#wave-gradient)"
+            strokeWidth="0.5"
+            fill="none"
+            className="animate-[wave-move_20s_linear_infinite]"
+            style={{ animationDelay: '-5s' }}
+          />
+        </svg>
 
-      {/* Keyframes */}
+        {/* Градиент размытия снизу */}
+        <div
+          className="absolute inset-x-0 bottom-0 h-1/2"
+          style={{
+            background: `linear-gradient(180deg, transparent 0%, ${palette.sky[0]}80 50%, ${palette.sky[0]} 100%)`,
+          }}
+        />
+
+        {/* Лёгкий шум/текстура */}
+        <div
+          className="absolute inset-0 opacity-[0.02] mix-blend-overlay"
+          style={{
+            backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E")`,
+          }}
+        />
+      </div>
+
+      {/* Keyframes для анимаций */}
       <style>{`
+        @keyframes float1 {
+          0%, 100% { transform: translate(0, 0) scale(1); }
+          25% { transform: translate(-30px, 20px) scale(1.05); }
+          50% { transform: translate(-20px, -30px) scale(0.95); }
+          75% { transform: translate(20px, 10px) scale(1.02); }
+        }
+        @keyframes float2 {
+          0%, 100% { transform: translate(0, 0) scale(1); }
+          33% { transform: translate(40px, -20px) scale(1.08); }
+          66% { transform: translate(-30px, 30px) scale(0.92); }
+        }
+        @keyframes float3 {
+          0%, 100% { transform: translate(0, 0) rotate(0deg); }
+          50% { transform: translate(-50px, -40px) rotate(10deg); }
+        }
+        @keyframes pulse-glow {
+          0%, 100% { opacity: 0.3; transform: translateX(-50%) scale(1); }
+          50% { opacity: 0.6; transform: translateX(-50%) scale(1.1); }
+        }
         @keyframes twinkle {
-          0% { transform: scale(1); opacity: 0.25; }
-          100% { transform: scale(1.35); opacity: 0.95; }
+          0%, 100% { opacity: 0.3; transform: scale(1); }
+          50% { opacity: 0.8; transform: scale(1.2); }
+        }
+        @keyframes wave-move {
+          0% { transform: translateX(-400px); }
+          100% { transform: translateX(400px); }
         }
       `}</style>
-    </div>
+    </>
   );
 }
-// === /Added ===
 
 interface MoonPhase {
   phase: string;
@@ -302,7 +235,6 @@ interface MoonPhase {
   nextFullMoon: string;
   emoji: string;
   image: string;
-
   isWaxing: boolean;
   quarterBadge?: string;
 }
@@ -332,13 +264,13 @@ export default function Home() {
   const [energy, setEnergy] = useState(850);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
 
-  // === Added: time-of-day state ===
+  // Time-of-day state
   const [timeOfDay, setTimeOfDay] = useState<TimeOfDay>(() => getTimeOfDay());
   useEffect(() => {
     const id = setInterval(() => setTimeOfDay(getTimeOfDay()), 5 * 60 * 1000);
     return () => clearInterval(id);
   }, []);
-  // === /Added ===
+
 
   useEffect(() => {
     loadHomeData();
@@ -377,7 +309,6 @@ export default function Home() {
           setEnergy(clientProfile.energy || 850);
         } else {
           console.log('Профиль клиента не найден, создаем новый');
-          // Создаем профиль с виджетами по умолчанию для новых пользователей
           const defaultWidgets = ['askeza', 'emotion-chart'];
           setActiveWidgets(defaultWidgets);
 
@@ -409,7 +340,6 @@ export default function Home() {
       const { widgets, order } = event.detail;
       const lsOrder = JSON.parse(localStorage.getItem('widget_order') || '[]');
       setActiveWidgets(lsOrder.length ? lsOrder : (order.length > 0 ? order : widgets));
-      // Перезагружаем аскезы после обновления виджетов
       loadAskezas();
     };
 
@@ -425,17 +355,13 @@ export default function Home() {
       await dbManager.init();
       const telegramId = getTelegramUserId();
 
-      // Получаем ВСЕ аскезы пользователя
       const dbAskezas = await dbManager.getAskezaEntriesByTelegramId(telegramId);
       console.log('Загружено аскез из базы:', dbAskezas.length);
 
-      // Фильтруем только те, которые должны показываться на главной
       const formattedAskezas: AskezaItem[] = dbAskezas
         .filter(askeza => {
           console.log(`Аскеза "${askeza.title}": show_on_home=${askeza.show_on_home}, is_active=${askeza.is_active}`);
-          // Проверяем различные типы данных для show_on_home
           const showOnHome = askeza.show_on_home;
-          // Используем строгую проверку типов для избежания ошибок TypeScript
           return showOnHome === true || 
                  (typeof showOnHome === 'number' && showOnHome === 1) || 
                  (typeof showOnHome === 'string' && (showOnHome === '1' || showOnHome === 'true'));
@@ -460,58 +386,16 @@ export default function Home() {
 
   const calculateMoonPhase = () => {
     const now = new Date();
-    const knownNewMoon = new Date('2000-01-06T18:14:00Z');
-    const lunarCycle = 29.53058867;
-    const daysSinceKnownNewMoon = (now.getTime() - knownNewMoon.getTime()) / (1000 * 60 * 60 * 24);
-    const currentCyclePosition = daysSinceKnownNewMoon % lunarCycle;
-    const isWaxing = currentCyclePosition <= (lunarCycle / 2);
-    let phase: string;
-    let emoji: string;
-    let image: string;
-
-    if (currentCyclePosition < 1) {
-      phase = 'Новолуние';
-      emoji = '🌑';
-      image = 'https://readdy.ai/api/search-image?query=3D%20rendered%20new%20moon%2C%20dark%20lunar%20sphere%20without%20circle%20frame%2C%20realistic%20space%20moon%2C%20night%20sky%2C%20astronomical%203D%20illustration%2C%20dark%20moon%20surface%2C%20cinematic%20lighting%2C%20high%20detail%203D%20model%2C%20no%20background%20circle&width=80&height=80&seq=3dnewmoon2&orientation=squarish';
-    } else if (currentCyclePosition < 7.4) {
-      phase = 'Растущая луна';
-      emoji = '🌒';
-      image = 'https://readdy.ai/api/search-image?query=3D%20rendered%20waxing%20crescent%20moon%20without%20circle%20frame%2C%20growing%20lunar%20phase%2C%20realistic%203D%20moon%20model%2C%20cinematic%20space%20lighting%2C%20detailed%20lunar%20surface%2C%20night%20sky%2C%20astronomical%203D%20illustration%2C%20no%20background%20circle&width=80&height=80&seq=3dwaxing2&orientation=squarish';
-    } else if (currentCyclePosition < 8.4) {
-      phase = 'Первая четверть';
-      emoji = '🌓';
-      image = 'https://readdy.ai/api/search-image?query=3D%20rendered%20first%20quarter%20moon%20without%20circle%20frame%2C%20half%20moon%20phase%2C%20realistic%20lunar%203D%20model%2C%20detailed%20moon%20surface%2C%20cinematic%20lighting%2C%20space%20illustration%2C%20astronomical%203D%20rendering%2C%20no%20background%20circle&width=80&height=80&seq=3dfirstquarter2&orientation=squarish';
-    } else if (currentCyclePosition < 14.8) {
-      phase = 'Растущая луна';
-      emoji = '🌔';
-      image = 'https://readdy.ai/api/search-image?query=3D%20rendered%20waxing%20gibbous%20moon%20without%20circle%20frame%2C%20almost%20full%20lunar%20phase%2C%20realistic%203D%20moon%20model%2C%20detailed%20surface%2C%20cinematic%20space%20lighting%2C%20astronomical%203D%20illustration%2C%20no%20background%20circle&width=80&height=80&seq=3dwaxinggibbous2&orientation=squarish';
-    } else if (currentCyclePosition < 15.8) {
-      phase = 'Полнолуние';
-      emoji = '🌕';
-      image = 'https://readdy.ai/api/search-image?query=3D%20rendered%20full%20moon%20without%20circle%20frame%2C%20bright%20complete%20lunar%20phase%2C%20realistic%203D%20moon%20model%2C%20detailed%20lunar%20surface%2C%20cinematic%20lighting%2C%20space%20illustration%2C%20high%20quality%203D%20rendering%2C%20no%20background%20circle&width=80&height=80&seq=3dfullmoon2&orientation=squarish';
-    } else if (currentCyclePosition < 22.1) {
-      phase = 'Убывающая луна';
-      emoji = '🌖';
-      image = 'https://readdy.ai/api/search-image?query=3D%20rendered%20waning%20gibbous%20moon%20without%20circle%20frame%2C%20decreasing%20lunar%20phase%2C%20realistic%203D%20moon%20model%2C%20detailed%20surface%2C%20cinematic%20space%20lighting%2C%20astronomical%203D%20illustration%2C%20no%20background%20circle&width=80&height=80&seq=3dwaninggibbous2&orientation=squarish';
-    } else if (currentCyclePosition < 23.1) {
-      phase = 'Последняя четверть';
-      emoji = '🌗';
-      image = 'https://readdy.ai/api/search-image?query=3D%20rendered%20last%20quarter%20moon%20without%20circle%20frame%2C%20half%20lunar%20phase%2C%20realistic%203D%20moon%20model%2C%20detailed%20moon%20surface%2C%20cinematic%20lighting%2C%20space%20illustration%2C%20astronomical%203D%20rendering%2C%20no%20background%20circle&width=80&height=80&seq=3dlastquarter2&orientation=squarish';
-    } else {
-      phase = 'Убывающая луна';
-      emoji = '🌘';
-      image = 'https://readdy.ai/api/search-image?query=3D%20rendered%20waning%20crescent%20moon%20without%20circle%20frame%2C%20thin%20lunar%20crescent%2C%20realistic%203D%20moon%20model%2C%20detailed%20surface%2C%20cinematic%20space%20lighting%2C%20astronomical%203D%20illustration%2C%20no%20background%20circle&width=80&height=80&seq=3dwaningcrescent2&orientation=squarish';
-    }
-
-    let illumination: number;
-    if (currentCyclePosition <= lunarCycle / 2) {
-      illumination = (currentCyclePosition / (lunarCycle / 2)) * 100;
-    } else {
-      illumination = ((lunarCycle - currentCyclePosition) / (lunarCycle / 2)) * 100;
-    }
-
-    const daysToFullMoon = lunarCycle / 2 - (currentCyclePosition % (lunarCycle / 2));
-    const nextFullMoonDate = new Date(now.getTime() + daysToFullMoon * 24 * 60 * 60 * 1000);
+    const phase = getMoonPhase(now);
+    const { name: phaseName, isWaxing } = getMoonPhaseName(phase);
+    const nextFullMoonDate = getNextFullMoon(now);
+    
+    // Освещённость: 0% при новолунии, 100% при полнолунии
+    const illumination = Math.round(
+      phase <= 0.5 
+        ? (phase / 0.5) * 100 
+        : ((1 - phase) / 0.5) * 100
+    );
 
     const nextFullMoon = nextFullMoonDate.toLocaleDateString('ru-RU', {
       day: 'numeric',
@@ -519,12 +403,12 @@ export default function Home() {
     });
 
     setMoonPhase({
-      phase,
+      phase: phaseName,
       isWaxing,
-      illumination: Math.round(illumination),
+      illumination,
       nextFullMoon,
-      emoji,
-      image
+      emoji: '',
+      image: ''
     });
   };
 
@@ -553,12 +437,10 @@ export default function Home() {
     }
   };
 
-  // Получаем данные пользователя
   const currentHour = new Date().getHours();
   const greeting = currentHour < 12 ? 'Доброе утро' : currentHour < 18 ? 'Добрый день' : 'Добрый вечер';
   const userName = userProfile?.name || getTelegramUserData().first_name || 'Друг';
 
-  // Дата и форматирование
   const today = new Date();
   const formattedDate = today.toLocaleDateString('ru-RU', { 
     weekday: 'long',
@@ -594,10 +476,8 @@ export default function Home() {
   if (loading) {
     return (
       <div className="min-h-screen relative overflow-hidden flex items-center justify-center">
-        {/* Красивый градиентный фон */}
         <div className="absolute inset-0 bg-gradient-to-br from-gray-900 via-black to-gray-800"></div>
 
-        {/* Анимированные частицы */}
         <div className="absolute inset-0">
           {[...Array(20)].map((_, i) => (
             <div
@@ -613,9 +493,7 @@ export default function Home() {
           ))}
         </div>
 
-        {/* Основной контент загрузчика */}
         <div className="relative z-10 text-center">
-          {/* Логотип */}
           <h1 
             className="text-5xl font-bold bg-gradient-to-r from-cyan-400 via-purple-400 to-pink-400 bg-clip-text text-transparent animate-pulse mb-8"
             style={{ fontFamily: 'Orbitron, monospace' }}
@@ -623,18 +501,15 @@ export default function Home() {
             COMPASS
           </h1>
 
-          {/* Анимированный спиннер */}
           <div className="relative mb-6">
             <div className="w-20 h-20 border-4 border-gray-600 border-t-transparent rounded-full animate-spin mx-auto"></div>
             <div className="absolute inset-0 w-20 h-20 border-4 border-transparent border-t-cyan-400 rounded-full animate-spin mx-auto"
                  style={{ animationDirection: 'reverse', animationDuration: '1.5s' }}></div>
           </div>
 
-          {/* Текст загрузки */}
           <p className="text-white/70 text-lg mb-2">Загрузка...</p>
           <p className="text-white/50 text-sm">Подготавливаем ваш персональный опыт</p>
 
-          {/* Анимированные точки */}
           <div className="flex justify-center space-x-2 mt-4">
             {[...Array(3)].map((_, i) => (
               <div
@@ -646,7 +521,6 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Декоративные элементы */}
         <div className="absolute top-10 left-10 w-4 h-4 border-2 border-purple-400/30 rounded-full animate-pulse"></div>
         <div className="absolute top-20 right-20 w-2 h-2 bg-cyan-400/40 rounded-full animate-ping"></div>
         <div className="absolute bottom-20 left-20 w-3 h-3 border border-pink-400/30 rotate-45 animate-pulse"></div>
@@ -657,7 +531,7 @@ export default function Home() {
 
   return (
     <div className="min-h-screen relative overflow-hidden">
-      {/* Динамический фон (заменён на единый слой) */}
+      {/* Динамический фон */}
       <BackgroundLayer timeOfDay={timeOfDay} />
 
       {/* Фиксированный стеклянный хедер */}
@@ -715,28 +589,44 @@ export default function Home() {
             <div className="text-white/60 text-xs">энергии</div>
           </div>
 
-          {/* Информация о луне справа под энергией */}
+          {/* Информация о луне - компактный дизайн без рамки */}
           {moonPhase && (
-            <div className="text-right mt-6 pt-4 border-t border-white/20">
-              <div className="text-white text-sm font-medium mb-1">{moonPhase.phase}</div>
-              <div className="text-white/70 text-xs mb-1">{moonPhase.illumination}%</div>
-              {/* Прогресс фазы луны */}
-              <div className="w-full h-2 rounded-full overflow-hidden mb-1"
+            <div className="mt-4 pt-3">
+              {/* Название фазы с иконкой */}
+              <div className="flex items-center justify-end gap-2 mb-1.5">
+                <span className="text-xl">
+                  {moonPhase.phase === 'Новолуние' ? '🌑' :
+                   moonPhase.phase === 'Растущий серп' ? '🌒' :
+                   moonPhase.phase === 'Первая четверть' ? '🌓' :
+                   moonPhase.phase === 'Растущая луна' ? '🌔' :
+                   moonPhase.phase === 'Полнолуние' ? '🌕' :
+                   moonPhase.phase === 'Убывающая луна' ? '🌖' :
+                   moonPhase.phase === 'Последняя четверть' ? '🌗' : '🌘'}
+                </span>
+                <span className="text-white/80 text-sm">{moonPhase.phase}</span>
+                <span className="text-white/60 text-xs">({moonPhase.illumination}%)</span>
+              </div>
+
+              {/* Компактная градиентная шкала */}
+              <div className="relative h-1.5 rounded-full overflow-hidden mb-1.5"
                    style={{
-                     background: 'rgba(255,255,255,0.12)'
+                     background: 'linear-gradient(90deg, rgba(30, 40, 80, 0.6) 0%, rgba(60, 80, 140, 0.4) 100%)',
                    }}>
                 <div
-                  className="h-full"
+                  className="h-full rounded-full"
                   style={{
                     width: `${moonPhase.illumination}%`,
-                    background: moonPhase.isWaxing
-                      ? 'linear-gradient(90deg, #0ea5e9 0%, #22d3ee 100%)'
-                      : 'linear-gradient(270deg, #fb923c 0%, #f97316 100%)',
-                    transition: 'width 0.6s ease'
+                    background: 'linear-gradient(90deg, rgba(147, 197, 253, 0.8) 0%, rgba(219, 234, 254, 1) 100%)',
+                    boxShadow: '0 0 8px rgba(147, 197, 253, 0.5)',
+                    transition: 'width 0.8s ease'
                   }}
                 />
               </div>
-              <div className="text-purple-300 text-xs">Полнолуние: {moonPhase.nextFullMoon}</div>
+
+              {/* Дата полнолуния */}
+              <div className="text-right text-xs text-white/40">
+                Полнолуние: <span className="text-blue-300/70">{moonPhase.nextFullMoon}</span>
+              </div>
             </div>
           )}
         </div>

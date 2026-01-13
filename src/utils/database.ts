@@ -79,6 +79,15 @@ export interface AskezaEntry {
   updated_at: string;
 }
 
+export interface AskezaReminderSetting {
+  telegram_id: number;
+  askeza_id: number;
+  time: string; // 'HH:MM'
+  enabled: number; // 1|0
+  created_at?: string;
+  updated_at?: string;
+}
+
 class DatabaseManager {
   private baseUrl = '/api/database'; // API endpoint на вашем сервере
   private initialized = false;
@@ -443,6 +452,41 @@ class DatabaseManager {
     }
   }
 
+
+  // Методы для работы с настройками уведомлений аскез (синхронизируется с ботом)
+  async getAskezaReminderSettings(telegramId: number): Promise<AskezaReminderSetting[]> {
+    const response = await fetch(`${this.baseUrl}/askeza-reminders/user/${telegramId}`);
+
+    if (!response.ok) {
+      throw new Error(`Ошибка получения настроек уведомлений аскез: ${response.statusText}`);
+    }
+
+    return await response.json();
+  }
+
+  async upsertAskezaReminderSetting(setting: AskezaReminderSetting): Promise<void> {
+    const response = await fetch(`${this.baseUrl}/askeza-reminders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(setting)
+    });
+
+    if (!response.ok) {
+      throw new Error(`Ошибка сохранения настроек уведомлений аскез: ${response.statusText}`);
+    }
+  }
+
+  async deleteAskezaReminderSetting(telegramId: number, askezaId: number): Promise<void> {
+    const response = await fetch(`${this.baseUrl}/askeza-reminders/user/${telegramId}/askeza/${askezaId}`, {
+      method: 'DELETE'
+    });
+
+    if (!response.ok) {
+      throw new Error(`Ошибка удаления настроек уведомлений аскез: ${response.statusText}`);
+    }
+  }
   // Утилитарные методы
   async clearAllData(): Promise<void> {
     const response = await fetch(`${this.baseUrl}/clear`, {

@@ -96,6 +96,7 @@ export default function AskezaPage() {
   const titleDraftRef = useRef("");
   const durationDraftRef = useRef<number>(30);
   const notifyTimeDraftRef = useRef("12:00");
+  const addModalScrollRef = useRef<HTMLDivElement | null>(null);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
   const durationInputRef = useRef<HTMLInputElement | null>(null);
   const notifyTimeInputRef = useRef<HTMLInputElement | null>(null);
@@ -110,8 +111,9 @@ export default function AskezaPage() {
     addModalNonceRef.current += 1;
     setAddModalNonce(addModalNonceRef.current);
 
-    // focus title on open
+    // Reset modal scroll so the title field is always reachable on mobile (iOS WebView can keep scroll position)
     requestAnimationFrame(() => {
+      if (addModalScrollRef.current) addModalScrollRef.current.scrollTop = 0;
       titleInputRef.current?.focus();
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -885,8 +887,12 @@ export default function AskezaPage() {
 
       {/* Add Askeza Modal */}
       {showAddForm && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-md z-50 flex items-center justify-center p-5">
-          <LiquidGlassCard className="w-full max-w-md p-6 mb-6">
+        <div
+          ref={addModalScrollRef}
+          className="fixed inset-0 bg-black/60 backdrop-blur-md z-50 flex items-start justify-center p-5 overflow-y-auto"
+          style={{ WebkitOverflowScrolling: "touch", paddingBottom: "max(20px, env(safe-area-inset-bottom))" } as any}
+        >
+          <LiquidGlassCard className="w-full max-w-md p-6 my-6">
             <div className="flex items-center justify-between mb-6">
               <h2 className="text-xl font-light text-white">Новая аскеза</h2>
               <button
@@ -979,7 +985,7 @@ export default function AskezaPage() {
               </div>
 
               {/* Notifications */}
-              <div className="p-4 rounded-2xl bg-white/5">
+              <div className="p-4 rounded-2xl bg-white/5 overflow-hidden">
                 <div className="flex items-center justify-between mb-3">
                   <span className="text-white/70 text-sm">Уведомления</span>
                   <button
@@ -1005,7 +1011,8 @@ export default function AskezaPage() {
                     onBlur={() => {
                       log("blur:notifyTime", { value: notifyTimeDraftRef.current });
                     }}
-                    className="w-full min-w-0 max-w-full block px-4 py-2.5 rounded-xl bg-white/10 border border-white/10 text-white focus:outline-none focus:border-cyan-400/50 box-border"
+                    className="w-full block px-4 py-2.5 rounded-xl bg-white/10 border border-white/10 text-white focus:outline-none focus:border-cyan-400/50 box-border appearance-none"
+                    style={{ width: "100%", maxWidth: "100%", WebkitAppearance: "none" } as any}
                   />
                 )}
               </div>

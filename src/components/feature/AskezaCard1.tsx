@@ -20,7 +20,6 @@ interface AskezaCardProps {
 
 export default function AskezaCard({ askeza, onUpdate }: AskezaCardProps) {
   const [showCelebration, setShowCelebration] = useState(false);
-  const [lastShownDay, setLastShownDay] = useState<number | null>(null);
 
   // Проверка выполнения аскезы сегодня
   const checkTodayCompletion = (): boolean => {
@@ -42,8 +41,6 @@ export default function AskezaCard({ askeza, onUpdate }: AskezaCardProps) {
       const today = new Date().toDateString();
       localStorage.setItem(`askeza_${askeza.id}_last_completed`, today);
       
-      setLastShownDay(newCurrentDay);
-
       // Показываем анимацию салюта
       setShowCelebration(true);
       
@@ -133,7 +130,7 @@ export default function AskezaCard({ askeza, onUpdate }: AskezaCardProps) {
         isOpen={showCelebration}
         onClose={() => setShowCelebration(false)}
         title="Отлично!"
-        message={`Вы выполнили аскезу "${askeza.title}" на ${(lastShownDay ?? (askeza.currentDay + 1))} день!`}
+        message={`Вы выполнили аскезу "${askeza.title}" на ${askeza.currentDay} день!`}
       />
     </>
   );

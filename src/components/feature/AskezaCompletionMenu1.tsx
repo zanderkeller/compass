@@ -6,8 +6,8 @@ interface AskezaCompletionMenuProps {
   onComplete: () => void;
   askezaTitle: string;
   askezaColor: string;
-  currentDay: number;
-  totalDays: number;
+  currentDay?: number;
+  totalDays?: number;
 }
 
 export default function AskezaCompletionMenu({
@@ -16,20 +16,12 @@ export default function AskezaCompletionMenu({
   onComplete,
   askezaTitle,
   askezaColor,
-  currentDay,
-  totalDays
+  currentDay = 0,
+  totalDays = 1
 }: AskezaCompletionMenuProps) {
   const [showCelebration, setShowCelebration] = useState(false);
   const [motivationText, setMotivationText] = useState('');
-
-  // Normalize props (protect against undefined/NaN and keep "last day" logic correct)
-  const safeTotalDays = Math.max(1, Number(totalDays) || 1);
-  const safeCurrentDay = (() => {
-    const n = Number(currentDay);
-    if (!Number.isFinite(n)) return 0;
-    return Math.min(Math.max(0, n), safeTotalDays - 1);
-  })();
-  const isLastDay = safeCurrentDay + 1 === safeTotalDays;
+  const isLastDay = currentDay + 1 === totalDays;
 
   // Мотивационные сообщения в зависимости от прогресса
   const getMotivationMessage = (progress: number) => {
@@ -68,12 +60,12 @@ export default function AskezaCompletionMenu({
 
   useEffect(() => {
     if (isOpen) {
-      const progress = safeCurrentDay / safeTotalDays;
+      const progress = currentDay / totalDays;
       const messages = getMotivationMessage(progress);
       const randomMessage = messages[Math.floor(Math.random() * messages.length)];
       setMotivationText(randomMessage);
     }
-  }, [isOpen, safeCurrentDay, safeTotalDays]);
+  }, [isOpen, currentDay, totalDays]);
 
   const handleComplete = () => {
     setShowCelebration(true);
@@ -170,7 +162,7 @@ export default function AskezaCompletionMenu({
                       Вы прошли путь от начала до конца!
                     </div>
                     <div className="text-cyan-400 text-lg">
-                      {safeTotalDays} дней силы духа! 💎
+                      {totalDays} дней силы духа! 💎
                     </div>
                   </>
                 ) : (
@@ -245,7 +237,7 @@ export default function AskezaCompletionMenu({
               </h3>
               <p className="text-white/70 text-sm mb-2">{askezaTitle}</p>
               <p className="text-cyan-400 text-sm mb-6">
-                День {safeCurrentDay + 1} из {safeTotalDays} • {Math.round(((safeCurrentDay + 1) / safeTotalDays) * 100)}%
+                День {currentDay + 1} из {totalDays} • {Math.round(((currentDay + 1) / totalDays) * 100)}%
               </p>
 
               {/* Мотивационный текст с неоновой рамкой */}
