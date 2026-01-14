@@ -24,7 +24,8 @@ type AskezaNotifRow = {
 };
 
 export default function AskezaPage() {
-  const DEBUG_INPUT = typeof window !== "undefined" && (localStorage.getItem("askeza_debug") === "1" || (window as any).__ASKEZA_DEBUG__);
+  const DEBUG_INPUT =
+    typeof window !== "undefined" && (localStorage.getItem("askeza_debug") === "1" || (window as any).__ASKEZA_DEBUG__);
   const log = (...args: any[]) => {
     if (!DEBUG_INPUT) return;
     // eslint-disable-next-line no-console
@@ -45,7 +46,12 @@ export default function AskezaPage() {
 
   const [showNotifModal, setShowNotifModal] = useState<number | null>(null);
 
-  const isAnyModalOpen = showAddForm || showCompletionMenu !== null || showDeleteConfirm !== null || showCelebration || showNotifModal !== null;
+  const isAnyModalOpen =
+    showAddForm ||
+    showCompletionMenu !== null ||
+    showDeleteConfirm !== null ||
+    showCelebration ||
+    showNotifModal !== null;
 
   useEffect(() => {
     log("modal-state", { showAddForm, showCompletionMenu, showDeleteConfirm, showCelebration, showNotifModal });
@@ -96,6 +102,7 @@ export default function AskezaPage() {
   const titleDraftRef = useRef("");
   const durationDraftRef = useRef<number>(30);
   const notifyTimeDraftRef = useRef("12:00");
+  const addModalScrollRef = useRef<HTMLDivElement | null>(null);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
   const durationInputRef = useRef<HTMLInputElement | null>(null);
   const notifyTimeInputRef = useRef<HTMLInputElement | null>(null);
@@ -110,8 +117,9 @@ export default function AskezaPage() {
     addModalNonceRef.current += 1;
     setAddModalNonce(addModalNonceRef.current);
 
-    // focus title on open
+    // Reset modal scroll so the title field is always reachable on mobile (iOS WebView can keep scroll position)
     requestAnimationFrame(() => {
+      if (addModalScrollRef.current) addModalScrollRef.current.scrollTop = 0;
       titleInputRef.current?.focus();
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -377,7 +385,8 @@ export default function AskezaPage() {
       let duration = newAskeza.duration;
       if (newAskeza.durationType === "week") duration = 7;
       if (newAskeza.durationType === "month") duration = 30;
-      if (newAskeza.durationType === "custom") duration = Math.max(1, Math.min(365, Number(durationDraftRef.current) || 1));
+      if (newAskeza.durationType === "custom")
+        duration = Math.max(1, Math.min(365, Number(durationDraftRef.current) || 1));
 
       const telegramId = getTelegramUserId();
       const now = new Date().toISOString();
@@ -474,9 +483,10 @@ export default function AskezaPage() {
   };
 
   const getButtonState = (askeza: AskezaItem) => {
+    // ВАЖНО: завершённую аскезу показываем как "finished", даже если она выключена (isActive=false)
+    if (askeza.currentDay >= askeza.duration) return "finished";
     if (!askeza.isActive) return "inactive";
     if (askeza.completedToday) return "completed";
-    if (askeza.currentDay >= askeza.duration) return "finished";
     return "active";
   };
 
@@ -630,8 +640,15 @@ export default function AskezaPage() {
             </div>
             <div className="w-px h-8 bg-white/10" />
             <div className="text-center">
-              <div className="text-2xl font-light text-cyan-400">{askezas.filter((a) => a.isActive).length}</div>
+              <div className="text-2xl font-light text-cyan-400">{askezas.filter((a) => a.isActive && a.currentDay < a.duration).length}</div>
               <div className="text-xs text-white/40">Активных</div>
+            </div>
+            <div className="w-px h-8 bg-white/10" />
+            <div className="text-center">
+              <div className="text-2xl font-light text-amber-400">
+                {askezas.filter((a) => a.currentDay >= a.duration).length}
+              </div>
+              <div className="text-xs text-white/40">Завершено</div>
             </div>
             <div className="w-px h-8 bg-white/10" />
             <div className="text-center">
@@ -643,6 +660,37 @@ export default function AskezaPage() {
           </div>
         </LiquidGlassCard>
       </div>
+
+      {/* Completed Askezas Section */}
+      {askezas.filter((a) => a.currentDay >= a.duration).length > 0 && (
+        <div className="relative z-10 px-5 mb-6">
+          <LiquidGlassCard className="p-4">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-10 h-10 rounded-xl flex items-center justify-center bg-gradient-to-br from-amber-400 to-orange-500">
+                <i className="ri-trophy-line text-white text-lg" />
+              </div>
+              <div>
+                <h3 className="text-lg font-medium text-white">Завершённые аскезы</h3>
+                <p className="text-white/40 text-sm">{askezas.filter((a) => a.currentDay >= a.duration).length} практик пройдено</p>
+              </div>
+            </div>
+            <div className="space-y-2">
+              {askezas.filter((a) => a.currentDay >= a.duration).map((askeza) => (
+                <div key={askeza.id} className="flex items-center gap-3 p-3 rounded-xl bg-white/5">
+                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center bg-gradient-to-br ${askeza.color}`}>
+                    <i className={`${askeza.icon} text-white text-lg`} />
+                  </div>
+                  <div className="flex-1">
+                    <div className="text-white font-medium">{askeza.title}</div>
+                    <div className="text-white/40 text-sm">{askeza.duration} дней выполнено</div>
+                  </div>
+                  <i className="ri-check-double-line text-amber-400 text-xl" />
+                </div>
+              ))}
+            </div>
+          </LiquidGlassCard>
+        </div>
+      )}
 
       {/* Askeza list */}
       <div className="relative z-10 px-5 space-y-4">
@@ -798,7 +846,10 @@ export default function AskezaPage() {
 
       {/* Notification Modal */}
       {showNotifModal && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-md z-50 flex items-start justify-center px-5 pt-16 pb-6 overflow-y-auto" style={{ WebkitOverflowScrolling: "touch" as any }}>
+        <div
+          className="fixed inset-0 bg-black/60 backdrop-blur-md z-50 flex items-start justify-center px-5 pt-16 pb-6 overflow-y-auto"
+          style={{ WebkitOverflowScrolling: "touch" as any }}
+        >
           <LiquidGlassCard className="w-full max-w-sm p-6">
             <div className="flex items-center justify-between mb-6">
               <h3 className="text-xl font-light text-white">Уведомления</h3>
@@ -885,8 +936,12 @@ export default function AskezaPage() {
 
       {/* Add Askeza Modal */}
       {showAddForm && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-md z-50 flex items-center justify-center p-5">
-          <LiquidGlassCard className="w-full max-w-md p-6 mb-6">
+        <div
+          ref={addModalScrollRef}
+          className="fixed inset-0 bg-black/60 backdrop-blur-md z-50 flex items-start justify-center p-5 overflow-y-auto"
+          style={{ WebkitOverflowScrolling: "touch", paddingBottom: "max(20px, env(safe-area-inset-bottom))" } as any}
+        >
+          <LiquidGlassCard className="w-full max-w-md p-6 my-6">
             <div className="flex items-center justify-between mb-6">
               <h2 className="text-xl font-light text-white">Новая аскеза</h2>
               <button
@@ -979,7 +1034,7 @@ export default function AskezaPage() {
               </div>
 
               {/* Notifications */}
-              <div className="p-4 rounded-2xl bg-white/5">
+              <div className="p-4 rounded-2xl bg-white/5 overflow-hidden">
                 <div className="flex items-center justify-between mb-3">
                   <span className="text-white/70 text-sm">Уведомления</span>
                   <button
@@ -1005,7 +1060,8 @@ export default function AskezaPage() {
                     onBlur={() => {
                       log("blur:notifyTime", { value: notifyTimeDraftRef.current });
                     }}
-                    className="w-full min-w-0 max-w-full block px-4 py-2.5 rounded-xl bg-white/10 border border-white/10 text-white focus:outline-none focus:border-cyan-400/50 box-border"
+                    className="w-full block px-4 py-2.5 rounded-xl bg-white/10 border border-white/10 text-white focus:outline-none focus:border-cyan-400/50 box-border appearance-none"
+                    style={{ width: "100%", maxWidth: "100%", WebkitAppearance: "none" } as any}
                   />
                 )}
               </div>
